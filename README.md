@@ -135,7 +135,7 @@ When `source=all`, both searches run concurrently. If one provider is unavailabl
   "authors": ["Author One"],
   "abstract": "Abstract text or null",
   "publication_date": "Provider date or null",
-  "year": 2025,
+  "year": 2026,
   "journal": "Journal/source name or null",
   "doi": "Normalised DOI or null",
   "url": "Provider record URL"
@@ -157,3 +157,4 @@ The backend accepts browser requests from `http://127.0.0.1:5500` and `http://lo
 ## Next Step
 
 Day 3 — RAG Part 1: Document Processing, Chunking, Embedding Preparation
+
