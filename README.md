@@ -157,4 +157,3 @@ The backend accepts browser requests from `http://127.0.0.1:5500` and `http://lo
 ## Next Step
 
 Day 3 — RAG Part 1: Document Processing, Chunking, Embedding Preparation
-

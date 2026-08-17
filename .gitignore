@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Editors
+.vscode/
+.idea/
+
+# Tests and tooling
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Operating systems
+.DS_Store
+Thumbs.db
