@@ -16,6 +16,8 @@ export default function ProjectDetailPage() {
   const [papers, setPapers] = useState([]);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [documents, setDocuments] = useState({});
+  const [retrieving, setRetrieving] = useState({});
   const [status, setStatus] = useState({ message: "Loading Project...", kind: "" });
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -30,8 +32,25 @@ export default function ProjectDetailPage() {
       if (!projectResponse.ok || !papersResponse.ok) throw new Error("Request failed");
       const projectData = await projectResponse.json();
       const paperData = await papersResponse.json();
+      const documentEntries = await Promise.all(
+        paperData.map(async (paper) => {
+          try {
+            const response = await fetch(
+              `${API_BASE_URL}/projects/${projectId}/papers/${paper.id}/document`,
+            );
+            if (!response.ok) {
+              return [paper.id, { retrieval_status: "not_retrieved" }];
+            }
+            return [paper.id, await response.json()];
+          } catch (error) {
+            console.error(`Unable to load document status for ${paper.id}`, error);
+            return [paper.id, { retrieval_status: "not_retrieved" }];
+          }
+        }),
+      );
       setProject(projectData);
       setPapers(paperData);
+      setDocuments(Object.fromEntries(documentEntries));
       setName(projectData.name);
       setDescription(projectData.description || "");
       setStatus({ message: "Project loaded.", kind: "success" });
@@ -80,6 +99,50 @@ export default function ProjectDetailPage() {
       console.error("Unable to remove paper", error);
       setStatus({ message: "Unable to remove the paper.", kind: "error" });
     }
+  }
+
+  async function retrieveDocument(paperId) {
+    setRetrieving((current) => ({ ...current, [paperId]: true }));
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/projects/${projectId}/papers/${paperId}/document`,
+        { method: "POST" },
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+      setDocuments((current) => ({ ...current, [paperId]: data }));
+      const message =
+        data.retrieval_status === "available"
+          ? "Full text is available."
+          : data.error_message || "No open-access full text was found.";
+      setStatus({
+        message,
+        kind: data.retrieval_status === "available" ? "success" : "error",
+      });
+    } catch (error) {
+      console.error("Unable to retrieve full text", error);
+      setDocuments((current) => ({
+        ...current,
+        [paperId]: {
+          retrieval_status: "failed",
+          error_message: error.message,
+        },
+      }));
+      setStatus({ message: `Full-text retrieval failed: ${error.message}`, kind: "error" });
+    } finally {
+      setRetrieving((current) => ({ ...current, [paperId]: false }));
+    }
+  }
+
+  function documentStatus(paperId) {
+    if (retrieving[paperId]) return "Retrieving";
+    const value = documents[paperId]?.retrieval_status || "not_retrieved";
+    return {
+      not_retrieved: "Not retrieved",
+      available: "Available",
+      unavailable: "Unavailable",
+      failed: "Failed",
+    }[value] || "Not retrieved";
   }
 
   async function deleteProject() {
@@ -161,9 +224,42 @@ export default function ProjectDetailPage() {
               <span>{paper.publication_year || "Year unavailable"}</span>
               <span>{paper.source === "pubmed" ? "PubMed" : "OpenAlex"}</span>
             </div>
-            <button className="danger" type="button" onClick={() => removePaper(paper.id)}>
-              Remove from Project
-            </button>
+            <section className="document-panel" aria-label="Full-text document">
+              <div className="document-heading">
+                <strong>Full text: {documentStatus(paper.id)}</strong>
+                <button
+                  type="button"
+                  disabled={retrieving[paper.id] || documents[paper.id]?.retrieval_status === "available"}
+                  onClick={() => retrieveDocument(paper.id)}
+                >
+                  {retrieving[paper.id] ? "Retrieving..." : "Retrieve Full Text"}
+                </button>
+              </div>
+              {documents[paper.id]?.retrieval_status === "available" && (
+                <>
+                  <dl className="document-meta">
+                    <dt>Source</dt>
+                    <dd>{documents[paper.id].source}</dd>
+                    <dt>Content type</dt>
+                    <dd>{documents[paper.id].content_type}</dd>
+                    <dt>Text length</dt>
+                    <dd>{documents[paper.id].text_length.toLocaleString()} characters</dd>
+                  </dl>
+                  <details>
+                    <summary>Text preview</summary>
+                    <p className="document-preview">{documents[paper.id].text_preview}</p>
+                  </details>
+                </>
+              )}
+              {["unavailable", "failed"].includes(documents[paper.id]?.retrieval_status) && (
+                <p className="document-error">{documents[paper.id].error_message}</p>
+              )}
+            </section>
+            <div className="actions">
+              <button className="danger" type="button" onClick={() => removePaper(paper.id)}>
+                Remove from Project
+              </button>
+            </div>
           </article>
         ))}
       </section>

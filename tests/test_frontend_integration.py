@@ -38,6 +38,14 @@ class FrontendIntegrationTests(unittest.TestCase):
         self.assertIn('method: "DELETE"', detail_page)
         self.assertIn("/papers/${paperId}", detail_page)
 
+    def test_project_detail_can_retrieve_and_preview_documents(self) -> None:
+        detail_page = (
+            FRONTEND_DIR / "app" / "projects" / "[projectId]" / "page.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Retrieve Full Text", detail_page)
+        self.assertIn("/papers/${paperId}/document", detail_page)
+        self.assertIn("text_preview", detail_page)
+
 
 if __name__ == "__main__":
     unittest.main()

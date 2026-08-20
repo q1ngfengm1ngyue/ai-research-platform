@@ -206,6 +206,40 @@ details p {
   margin-bottom: 12px;
 }
 
+.document-panel {
+  margin-top: 16px;
+  padding: 16px;
+  border-radius: 6px;
+  background: #f5f8fa;
+}
+
+.document-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.document-heading button {
+  padding: 8px 12px;
+}
+
+.document-meta {
+  margin-top: 16px;
+}
+
+.document-preview {
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.document-error {
+  margin: 14px 0 0;
+  color: #842029;
+}
+
 @media (max-width: 640px) {
   main {
     margin: 16px auto;

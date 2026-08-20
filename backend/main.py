@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from sqlalchemy.exc import SQLAlchemyError
 
+from backend.api.routes.documents import router as documents_router
 from backend.api.routes.literature import router as literature_router
 from backend.api.routes.papers import router as papers_router
 from backend.api.routes.projects import router as projects_router
@@ -17,7 +18,7 @@ load_dotenv()
 app = FastAPI(
     title="AI Research Assistant Platform",
     description="V1 prototype backend",
-    version="0.3.0",
+    version="0.5.0",
 )
 
 # The frontend is served locally on port 5500 during V1 development.
@@ -37,6 +38,7 @@ app.add_middleware(
 app.include_router(literature_router)
 app.include_router(projects_router)
 app.include_router(papers_router)
+app.include_router(documents_router)
 
 
 @app.get("/")

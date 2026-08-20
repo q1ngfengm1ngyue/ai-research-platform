@@ -10,9 +10,9 @@ V1 Prototype
 
 ## Current Stage
 
-Day 3 — Project Workspace and Literature Management
+Task 5 — Open-Access Document Retrieval and Parsing
 
-The application searches real PubMed and OpenAlex metadata, manages research Projects, and saves provider-independent papers into a project-scoped PostgreSQL library. PDF processing, chunking, embeddings, pgvector, RAG, LLM calls, and agents are intentionally not included yet.
+The application searches real PubMed and OpenAlex metadata, manages research Projects, saves provider-independent papers into a project-scoped PostgreSQL library, and can retrieve legally available full text as clean, persisted document text. Chunking, embeddings, pgvector, semantic search, RAG, citation generation, LLM calls, and agents are intentionally not included yet.
 
 The original static HTML/CSS/JavaScript behavior and visual style have been migrated to a minimal Next.js App Router frontend.
 
@@ -24,11 +24,14 @@ Next.js App Router frontend
   │     ├── PubMed: ESearch → EFetch → XML parser
   │     └── OpenAlex: Works search → JSON parser
   ├── Project workspace → /projects CRUD
-  └── Save Paper → /projects/{project_id}/papers
+  ├── Save Paper → /projects/{project_id}/papers
+  └── Retrieve document → PMC JATS first, then OpenAlex OA location
                            ↓
                     FastAPI routes
                            ↓
-                 Project/Paper services
+          Project/Paper/Document services
+                           ↓
+               XML / HTML / PDF parsers
                            ↓
                      SQLAlchemy 2
                            ↓
@@ -43,11 +46,15 @@ ai-research-platform/
 │   ├── api/
 │   │   ├── dependencies.py
 │   │   └── routes/
+│   │       ├── documents.py
 │   │       ├── literature.py
 │   │       ├── papers.py
 │   │       └── projects.py
-│   ├── models/project.py
+│   ├── models/
+│   │   ├── document.py
+│   │   └── project.py
 │   ├── schemas/
+│   │   ├── documents.py
 │   │   ├── literature.py
 │   │   └── projects.py
 │   ├── services/literature/
@@ -56,6 +63,12 @@ ai-research-platform/
 │   │   └── pubmed_service.py
 │   ├── services/paper_service.py
 │   ├── services/project_service.py
+│   ├── services/document_service.py
+│   ├── services/documents/
+│   │   ├── acquisition.py
+│   │   ├── http_client.py
+│   │   ├── sources.py
+│   │   └── parsers/
 │   ├── database.py
 │   └── main.py
 ├── frontend/
@@ -74,6 +87,9 @@ ai-research-platform/
 ├── scripts/init_db.py
 ├── tests/
 │   ├── test_api_validation.py
+│   ├── test_document_acquisition.py
+│   ├── test_document_api.py
+│   ├── test_document_parsers.py
 │   ├── test_frontend_integration.py
 │   ├── test_literature_parsing.py
 │   └── test_project_api.py
@@ -92,11 +108,13 @@ GitHub's middle file-list column displays the latest commit message, not a custo
 
 | Path | Purpose |
 | --- | --- |
-| `backend/api/routes/` | Literature, Project, and saved-paper HTTP endpoints |
-| `backend/models/` | SQLAlchemy Project and Paper tables |
+| `backend/api/routes/` | Literature, Project, saved-paper, and Document endpoints |
+| `backend/models/` | SQLAlchemy Project, Paper, and PaperDocument tables |
 | `backend/services/literature/` | Existing PubMed/OpenAlex integrations |
 | `backend/services/project_service.py` | Project CRUD operations |
 | `backend/services/paper_service.py` | Paper persistence and deduplication |
+| `backend/services/document_service.py` | Document cache, persistence, and response presentation |
+| `backend/services/documents/` | OA discovery, bounded HTTP reads, and content-specific parsers |
 | `backend/database.py` | Engine, Session, Base, initialization, and health query |
 | `frontend/app/` | Next.js App Router search, Project list, and dynamic detail routes |
 | `scripts/init_db.py` | Creates Day 3 tables in PostgreSQL |
@@ -112,6 +130,10 @@ GitHub's middle file-list column displays the latest commit message, not a custo
 - unique `(project_id, doi)` when DOI is present.
 
 PostgreSQL permits multiple `NULL` DOI values. The same paper can be saved once in Project A and independently once in Project B.
+
+`paper_documents` contains `id`, unique `paper_id`, `source`, `source_url`, `content_type`, `title`, `text`, `retrieval_status`, `error_message`, `retrieved_at`, `created_at`, and `updated_at`. `paper_id` references `papers.id` with cascade delete, giving each saved Paper at most one current Document row. Retrieval status is constrained to `available`, `unavailable`, or `failed`.
+
+This project currently uses `Base.metadata.create_all()` through `python -m scripts.init_db` for additive table initialization; Alembic is not configured. Running the initializer against an existing Task 1–4 PostgreSQL database creates `paper_documents` without rewriting `projects` or `papers`.
 
 ## Environment Variables
 
@@ -206,6 +228,10 @@ Keep both terminal processes running while using the page. Stop either server wi
 | POST | `/projects/{project_id}/papers` | Save/deduplicate search result | Paper and created flag |
 | GET | `/projects/{project_id}/papers` | List Project papers | Paper list |
 | DELETE | `/projects/{project_id}/papers/{paper_id}` | Remove Project paper | No content |
+| GET | `/projects/{project_id}/papers/{paper_id}/document` | Read persisted retrieval status and text preview | Document status |
+| POST | `/projects/{project_id}/papers/{paper_id}/document` | Retrieve, parse, and persist legal OA full text | Document status |
+
+The Document POST endpoint accepts the optional query parameter `force_refresh=true`. By default, an already available Document is returned from PostgreSQL with `cached: true` and no external download. Failed or unavailable attempts update the same one-to-one row rather than creating duplicates.
 
 The search endpoint accepts:
 
@@ -224,6 +250,58 @@ Examples:
 ```
 
 When `source=all`, both searches run concurrently. If one provider is unavailable, results from the other are returned with a warning; if both fail, the API returns a safe `503` response.
+
+## Document Retrieval
+
+### Supported full-text sources
+
+The retrieval service uses saved Paper metadata and never accepts an arbitrary download URL from an API caller:
+
+1. For a saved PubMed paper, NCBI ELink maps the PMID to PMC. When available, PMC JATS/XML is downloaded through NCBI EFetch and preferred over PDF.
+2. If PMC is unavailable or fails, a saved OpenAlex ID—or a DOI saved with either provider—is resolved through the OpenAlex Works API. Only a location declared open access by OpenAlex is considered; `best_oa_location` is preferred, followed by an OA `primary_location`.
+3. An OA location may return XML/JATS, HTML, PDF, or plain text. The response Content-Type and PDF signature determine the parser.
+
+The system does **not** bypass paywalls, authenticate to publisher accounts, use Sci-Hub, defeat PDF protections, or download from caller-supplied URLs.
+
+### Parsing and clean text
+
+- JATS/XML extraction retains the article title, abstract, section headings, and body paragraphs.
+- HTML extraction removes script, style, navigation, header, footer, aside, and markup before normalizing readable text.
+- PDF extraction uses `pypdf` and reads the existing text layer only. OCR is not performed.
+- Unicode is normalized, repeated horizontal whitespace is collapsed, and paragraph boundaries are retained. The result is not chunked.
+
+API responses return metadata, text length, and at most the first 1,500 characters as `text_preview`; the complete clean text remains in PostgreSQL for later processing stages.
+
+### Retrieval states and failures
+
+The project detail page displays `Not retrieved`, `Retrieving`, `Available`, `Unavailable`, or `Failed`. `Unavailable` means no declared OA source was found. Expected provider timeouts, HTTP 403/404/429/5xx responses, empty bodies, malformed documents, unsupported content types, encrypted or damaged PDFs, and PDFs without a text layer are returned as structured status/error fields instead of uncaught FastAPI errors.
+
+External requests use a descriptive User-Agent, bounded connect/read timeouts, no unbounded retry, at most three redirects, and a 25 MiB download limit. Every initial and redirected URL must use HTTP(S), ports 80/443, and a publicly routable host; localhost, private, loopback, link-local, and other non-public addresses are rejected.
+
+### Triggering retrieval
+
+In the UI, open `/projects/{project_id}` and choose **Retrieve Full Text** on a saved paper. On success the card shows the source, normalized content type, text length, and preview.
+
+PowerShell API example:
+
+```powershell
+$projectId = '<project UUID>'
+$paperId = '<paper UUID>'
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/projects/$projectId/papers/$paperId/document"
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/projects/$projectId/papers/$paperId/document"
+```
+
+### Current limitations
+
+- PMC discovery currently starts from a PubMed PMID; manually entered PMC IDs are not a separate Paper source.
+- OpenAlex fallback depends on a valid saved OpenAlex ID or DOI and on OpenAlex marking the location OA.
+- HTML extraction is conservative heuristic text cleanup, not a publisher-specific readability engine.
+- Scanned/image-only and encrypted PDFs are reported as failed; OCR and password handling are intentionally absent.
+- A source larger than 25 MiB is rejected, and transient failures are not automatically retried.
+- The API intentionally exposes only a bounded preview, not a dedicated full-text reader endpoint.
+- The current initialization mechanism creates new tables but does not provide versioned schema downgrades.
 
 ## Unified Literature Item
 
@@ -248,7 +326,7 @@ When `source=all`, both searches run concurrently. If one provider is unavailabl
 python -m unittest discover -s tests -v
 ```
 
-The suite checks Day 1 regression behavior, Day 2 request validation/provider parsers, Project CRUD, PubMed/OpenAlex save payloads, external-id and DOI deduplication, Project A/Project B isolation, paper removal, the Next.js App Router structure, and frontend API paths. Unit/API tests use a deterministic in-memory SQLAlchemy test engine; the real PostgreSQL verification below is run separately.
+The suite checks Task 1 regression behavior, literature request validation/provider parsers, Project CRUD, PubMed/OpenAlex save payloads, deduplication and Project isolation, XML/HTML/PDF parsing, mocked PMC/OpenAlex acquisition failures, Document API persistence/cache behavior, the Next.js App Router structure, and frontend API paths. Unit/API tests use a deterministic in-memory SQLAlchemy test engine; real PostgreSQL and OA verification are run separately.
 
 Verify the frontend production build separately:
 
@@ -257,7 +335,20 @@ Set-Location frontend
 npm run build
 ```
 
-## Day 3 Acceptance Verification
+## Task 5 Acceptance Verification
+
+Verified locally on 2026-08-20 with Python 3.12, `pypdf` 6.16.1, Next.js 16.3.1, Docker Engine 29.7.2, PostgreSQL 16, and the repository's existing Task 1–4 data:
+
+- `python -m scripts.init_db` added `paper_documents` to the real PostgreSQL database while retaining `projects` and `papers`.
+- A real API smoke Paper with PMID `16060722` mapped to `PMC1182327`.
+- NCBI EFetch returned PMC JATS/XML, which parsed to 28,481 characters of clean text and persisted with status `available`.
+- A new Python/FastAPI process queried the same Document ID, text length, and preview from PostgreSQL without making another retrieval request.
+- Automated test result: 37 passed, 0 failed.
+- Next.js production build completed successfully for `/`, `/projects`, and `/projects/[projectId]`.
+
+The smoke Project is named `Task 5 OA Smoke 2026-08-20` so its persisted Paper and Document can be inspected locally.
+
+## Earlier Task 3 Acceptance Verification
 
 Verified locally on 2026-08-19 with Node.js 24.19.0, npm 11.17.0, Docker Engine 29.7.2, Docker Compose 5.4.0, and PostgreSQL 16.15:
 
@@ -278,6 +369,6 @@ Local `.env`, `frontend/.env.local`, `node_modules`, `.next`, and the Docker vol
 
 The backend accepts the Next.js development origins `http://127.0.0.1:3000` and `http://localhost:3000`. The former static-server port 5500 remains allowed for local compatibility.
 
-## Day 4 Readiness
+## Task 6+ Readiness
 
-Stable Project IDs, project-scoped Paper IDs, PostgreSQL configuration, SQLAlchemy sessions, cascade behavior, and a persistent literature library are now prepared for later PDF, chunking, embedding, pgvector, and RAG work. Those Day 4 features are not implemented here.
+Stable Project/Paper/Document IDs, project-scoped access, clean persisted document text, PostgreSQL sessions, and cascade behavior are now prepared for later chunking and metadata work. Chunking, embedding, pgvector, semantic search, RAG, citation generation, and complete research QA workflows are not implemented in Task 5.

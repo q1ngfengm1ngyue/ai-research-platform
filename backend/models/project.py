@@ -84,3 +84,9 @@ class Paper(Base):
     )
 
     project: Mapped[Project] = relationship(back_populates="papers")
+    document: Mapped["PaperDocument | None"] = relationship(
+        back_populates="paper",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        uselist=False,
+    )

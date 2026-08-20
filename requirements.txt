@@ -2,5 +2,6 @@ fastapi
 httpx
 psycopg[binary]
 python-dotenv
+pypdf
 sqlalchemy
 uvicorn
