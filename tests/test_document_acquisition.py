@@ -99,6 +99,115 @@ class DocumentAcquisitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.source, "openalex")
         self.assertEqual(outcome.content_type, "pdf")
 
+    async def test_pubmed_metadata_can_use_openalex_document_provider(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "elink.fcgi" in request.url.path:
+                return _json_response(request, {"linksets": [{"linksetdbs": []}]})
+            if request.url.host == "api.openalex.org":
+                return _json_response(
+                    request,
+                    {
+                        "open_access": {"is_oa": True},
+                        "best_oa_location": {
+                            "landing_page_url": "https://oa.example/article"
+                        },
+                    },
+                )
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html"},
+                content=b"<article><p>Cross-provider full text.</p></article>",
+                request=request,
+            )
+
+        outcome = await self._acquire(
+            _paper("pubmed", doi="10.1000/cross-provider"), handler
+        )
+
+        self.assertEqual(outcome.retrieval_status, "available")
+        self.assertEqual(outcome.source, "openalex")
+        self.assertEqual(outcome.content_type, "html")
+        self.assertIn("Cross-provider full text", outcome.text or "")
+
+    async def test_structured_candidate_ranks_ahead_of_html_and_pdf(self) -> None:
+        downloaded_candidates: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "elink.fcgi" in request.url.path:
+                return _json_response(
+                    request,
+                    {"linksets": [{"linksetdbs": [{"dbto": "pmc", "links": ["999"]}]}]},
+                )
+            if request.url.host == "api.openalex.org":
+                return _json_response(
+                    request,
+                    {
+                        "open_access": {"is_oa": True},
+                        "best_oa_location": {
+                            "landing_page_url": "https://oa.example/article",
+                            "pdf_url": "https://oa.example/article.pdf",
+                        },
+                    },
+                )
+            downloaded_candidates.append(str(request.url))
+            if "efetch.fcgi" in request.url.path:
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "application/xml"},
+                    content=b"<article><body><p>Structured text.</p></body></article>",
+                    request=request,
+                )
+            self.fail(f"Lower-priority candidate was fetched: {request.url}")
+
+        outcome = await self._acquire(
+            _paper("pubmed", doi="10.1000/ranked"), handler
+        )
+
+        self.assertEqual(outcome.source, "pmc")
+        self.assertEqual(outcome.content_type, "xml")
+        self.assertEqual(len(downloaded_candidates), 1)
+
+    async def test_failed_structured_candidate_falls_back_to_ranked_html(self) -> None:
+        downloaded_candidates: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "elink.fcgi" in request.url.path:
+                return _json_response(
+                    request,
+                    {"linksets": [{"linksetdbs": [{"dbto": "pmc", "links": ["999"]}]}]},
+                )
+            if request.url.host == "api.openalex.org":
+                return _json_response(
+                    request,
+                    {
+                        "open_access": {"is_oa": True},
+                        "best_oa_location": {
+                            "landing_page_url": "https://oa.example/article",
+                            "pdf_url": "https://oa.example/article.pdf",
+                        },
+                    },
+                )
+            downloaded_candidates.append(str(request.url))
+            if "efetch.fcgi" in request.url.path:
+                return httpx.Response(500, request=request)
+            if request.url.path == "/article":
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "text/html"},
+                    content=b"<article><p>HTML fallback text.</p></article>",
+                    request=request,
+                )
+            self.fail(f"PDF should not be reached after HTML succeeds: {request.url}")
+
+        outcome = await self._acquire(
+            _paper("pubmed", doi="10.1000/fallback"), handler
+        )
+
+        self.assertEqual(outcome.retrieval_status, "available")
+        self.assertEqual(outcome.source, "openalex")
+        self.assertEqual(outcome.content_type, "html")
+        self.assertEqual(len(downloaded_candidates), 2)
+
     async def test_404_becomes_failed_status(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(404, request=request)

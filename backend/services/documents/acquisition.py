@@ -15,9 +15,8 @@ from backend.services.documents.http_client import (
 )
 from backend.services.documents.parsers import DocumentParseError, parse_document
 from backend.services.documents.sources import (
-    SourceCandidate,
-    discover_openalex_source,
-    discover_pmc_source,
+    FullTextCandidate,
+    discover_candidates,
 )
 
 
@@ -36,7 +35,7 @@ class AcquisitionOutcome:
 
 
 class DocumentAcquisitionService:
-    """Try PMC first, then OpenAlex-declared OA locations."""
+    """Fetch and parse ranked candidates without depending on provider details."""
 
     def __init__(
         self,
@@ -63,48 +62,22 @@ class DocumentAcquisitionService:
     async def _acquire_with_client(
         self, client: httpx.AsyncClient, paper: Paper
     ) -> AcquisitionOutcome:
-        errors: list[str] = []
-        last_candidate: SourceCandidate | None = None
-
-        try:
-            pmc_candidate = await discover_pmc_source(
-                client, paper, validate_hosts=self.validate_hosts
-            )
-            if pmc_candidate:
-                last_candidate = pmc_candidate
-                outcome, error = await self._retrieve_candidate(
-                    client, paper, pmc_candidate
-                )
-                if outcome is not None:
-                    return outcome
-                if error:
-                    errors.append(error)
-        except RemoteAccessError as exc:
-            logger.warning("PMC discovery failed for paper %s: %s", paper.id, exc)
-            errors.append(f"PMC lookup failed: {exc}")
-
-        try:
-            openalex_candidate = await discover_openalex_source(
-                client, paper, validate_hosts=self.validate_hosts
-            )
-            if openalex_candidate and (
-                last_candidate is None or openalex_candidate.url != last_candidate.url
-            ):
-                last_candidate = openalex_candidate
-                outcome, error = await self._retrieve_candidate(
-                    client, paper, openalex_candidate
-                )
-                if outcome is not None:
-                    return outcome
-                if error:
-                    errors.append(error)
-        except RemoteAccessError as exc:
-            logger.warning("OpenAlex OA discovery failed for paper %s: %s", paper.id, exc)
-            errors.append(f"OpenAlex lookup failed: {exc}")
+        discovery = await discover_candidates(
+            client, paper, validate_hosts=self.validate_hosts
+        )
+        errors = list(discovery.errors)
+        last_candidate: FullTextCandidate | None = None
+        for candidate in discovery.candidates:
+            last_candidate = candidate
+            outcome, error = await self._retrieve_candidate(client, paper, candidate)
+            if outcome is not None:
+                return outcome
+            if error:
+                errors.append(error)
 
         if errors:
             return AcquisitionOutcome(
-                source=last_candidate.source if last_candidate else "unknown",
+                source=last_candidate.provider if last_candidate else "unknown",
                 source_url=(
                     _public_source_url(last_candidate.public_url or last_candidate.url)
                     if last_candidate
@@ -130,7 +103,7 @@ class DocumentAcquisitionService:
         self,
         client: httpx.AsyncClient,
         paper: Paper,
-        candidate: SourceCandidate,
+        candidate: FullTextCandidate,
     ) -> tuple[AcquisitionOutcome | None, str | None]:
         try:
             payload = await fetch_bytes(
@@ -140,11 +113,13 @@ class DocumentAcquisitionService:
                 validate_hosts=self.validate_hosts,
             )
             content_type, parsed = parse_document(
-                payload.body, payload.media_type, payload.url
+                payload.body,
+                payload.media_type or candidate.content_type_hint or "",
+                payload.url,
             )
             return (
                 AcquisitionOutcome(
-                    source=candidate.source,
+                    source=candidate.provider,
                     source_url=_public_source_url(candidate.public_url or payload.url),
                     content_type=content_type,
                     title=parsed.title or paper.title,
@@ -157,11 +132,11 @@ class DocumentAcquisitionService:
         except (RemoteAccessError, DocumentParseError) as exc:
             logger.warning(
                 "Document candidate %s failed for paper %s: %s",
-                candidate.source,
+                candidate.provider,
                 paper.id,
                 exc,
             )
-            return None, f"{candidate.source} retrieval failed: {exc}"
+            return None, f"{candidate.provider} retrieval failed: {exc}"
 
 
 def _public_source_url(url: str) -> str:

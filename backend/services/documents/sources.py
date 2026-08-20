@@ -1,4 +1,4 @@
-"""Discovery of legal open-access full-text sources."""
+"""Provider-independent discovery of legal full-text candidates."""
 
 from dataclasses import dataclass
 import os
@@ -9,7 +9,7 @@ from urllib.parse import quote
 import httpx
 
 from backend.models.project import Paper
-from backend.services.documents.http_client import fetch_json
+from backend.services.documents.http_client import RemoteAccessError, fetch_json
 
 
 ELINK_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi"
@@ -17,22 +17,64 @@ PMC_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 OPENALEX_ID_PATTERN = re.compile(r"^W\d+$", re.IGNORECASE)
 
+STRUCTURED_FULLTEXT_PRIORITY = 10
+OA_HTML_PRIORITY = 20
+OA_PDF_PRIORITY = 30
+PLAIN_TEXT_PRIORITY = 40
+
 
 @dataclass(frozen=True)
-class SourceCandidate:
-    source: str
+class FullTextCandidate:
+    """One legally discoverable document URL, independent of Paper metadata source."""
+
+    provider: str
     url: str
+    source_kind: str
+    priority: int
+    content_type_hint: str | None = None
     params: dict[str, str] | None = None
     public_url: str | None = None
 
 
-async def discover_pmc_source(
+@dataclass(frozen=True)
+class CandidateDiscovery:
+    """Ranked candidates plus safe provider-discovery errors."""
+
+    candidates: tuple[FullTextCandidate, ...]
+    errors: tuple[str, ...]
+
+
+async def discover_candidates(
     client: httpx.AsyncClient, paper: Paper, *, validate_hosts: bool
-) -> SourceCandidate | None:
-    """Map a PubMed PMID to PMC and return the JATS EFetch endpoint."""
+) -> CandidateDiscovery:
+    """Run current full-text providers and return one ranked candidate stream."""
+
+    candidates: list[FullTextCandidate] = []
+    errors: list[str] = []
+    providers = (
+        ("PMC", discover_from_pmc),
+        ("OpenAlex", discover_from_openalex),
+    )
+    for provider_name, discover in providers:
+        try:
+            candidates.extend(
+                await discover(client, paper, validate_hosts=validate_hosts)
+            )
+        except RemoteAccessError as exc:
+            errors.append(f"{provider_name} lookup failed: {exc}")
+    return CandidateDiscovery(
+        candidates=tuple(_rank_and_deduplicate(candidates)),
+        errors=tuple(errors),
+    )
+
+
+async def discover_from_pmc(
+    client: httpx.AsyncClient, paper: Paper, *, validate_hosts: bool
+) -> list[FullTextCandidate]:
+    """Map known PubMed identifiers to PMC JATS candidates."""
 
     if paper.source != "pubmed" or not paper.external_id.isdigit():
-        return None
+        return []
     params = {
         "dbfrom": "pubmed",
         "db": "pmc",
@@ -48,7 +90,7 @@ async def discover_pmc_source(
     )
     pmc_id = _pmc_id_from_elink(data)
     if pmc_id is None:
-        return None
+        return []
     fetch_params = {
         "db": "pmc",
         "id": pmc_id,
@@ -57,18 +99,23 @@ async def discover_pmc_source(
     }
     if api_key:
         fetch_params["api_key"] = api_key
-    return SourceCandidate(
-        source="pmc",
-        url=PMC_EFETCH_URL,
-        params=fetch_params,
-        public_url=f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{pmc_id}/",
-    )
+    return [
+        FullTextCandidate(
+            provider="pmc",
+            url=PMC_EFETCH_URL,
+            source_kind="structured_fulltext",
+            priority=STRUCTURED_FULLTEXT_PRIORITY,
+            content_type_hint="application/xml",
+            params=fetch_params,
+            public_url=f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{pmc_id}/",
+        )
+    ]
 
 
-async def discover_openalex_source(
+async def discover_from_openalex(
     client: httpx.AsyncClient, paper: Paper, *, validate_hosts: bool
-) -> SourceCandidate | None:
-    """Read OpenAlex work metadata and select a declared OA location."""
+) -> list[FullTextCandidate]:
+    """Convert OpenAlex-declared OA locations into unified candidates."""
 
     identifier: str | None = None
     if paper.source == "openalex" and OPENALEX_ID_PATTERN.fullmatch(paper.external_id):
@@ -76,7 +123,7 @@ async def discover_openalex_source(
     elif paper.doi:
         identifier = f"https://doi.org/{paper.doi}"
     if identifier is None:
-        return None
+        return []
 
     work_url = f"{OPENALEX_WORKS_URL}/{quote(identifier, safe=':/')}"
     params: dict[str, str] = {}
@@ -89,8 +136,20 @@ async def discover_openalex_source(
         params=params or None,
         validate_hosts=validate_hosts,
     )
-    oa_url = _openalex_oa_url(data)
-    return SourceCandidate(source="openalex", url=oa_url) if oa_url else None
+    return _openalex_oa_candidates(data)
+
+
+def _rank_and_deduplicate(
+    candidates: list[FullTextCandidate],
+) -> list[FullTextCandidate]:
+    """Prefer candidate quality while fetching any duplicated URL only once."""
+
+    by_url: dict[str, FullTextCandidate] = {}
+    for candidate in candidates:
+        existing = by_url.get(candidate.url)
+        if existing is None or candidate.priority < existing.priority:
+            by_url[candidate.url] = candidate
+    return sorted(by_url.values(), key=lambda candidate: candidate.priority)
 
 
 def _pmc_id_from_elink(data: Any) -> str | None:
@@ -112,21 +171,44 @@ def _pmc_id_from_elink(data: Any) -> str | None:
     return None
 
 
-def _openalex_oa_url(data: Any) -> str | None:
+def _openalex_oa_candidates(data: Any) -> list[FullTextCandidate]:
     if not isinstance(data, dict):
-        return None
+        return []
     open_access = data.get("open_access")
     if not isinstance(open_access, dict) or open_access.get("is_oa") is not True:
-        return None
+        return []
 
+    candidates: list[FullTextCandidate] = []
     locations = [data.get("best_oa_location"), data.get("primary_location")]
     for index, location in enumerate(locations):
         if not isinstance(location, dict):
             continue
         if index > 0 and location.get("is_oa") is not True:
             continue
-        for field in ("pdf_url", "landing_page_url"):
-            value = location.get(field)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
+        landing_page_url = _optional_string(location.get("landing_page_url"))
+        if landing_page_url:
+            candidates.append(
+                FullTextCandidate(
+                    provider="openalex",
+                    url=landing_page_url,
+                    source_kind="oa_html",
+                    priority=OA_HTML_PRIORITY,
+                    content_type_hint="text/html",
+                )
+            )
+        pdf_url = _optional_string(location.get("pdf_url"))
+        if pdf_url:
+            candidates.append(
+                FullTextCandidate(
+                    provider="openalex",
+                    url=pdf_url,
+                    source_kind="oa_pdf",
+                    priority=OA_PDF_PRIORITY,
+                    content_type_hint="application/pdf",
+                )
+            )
+    return candidates
+
+
+def _optional_string(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None

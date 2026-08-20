@@ -10,7 +10,7 @@ V1 Prototype
 
 ## Current Stage
 
-Task 5 — Open-Access Document Retrieval and Parsing
+Task 5.1 — Provider-Independent Document Acquisition
 
 The application searches real PubMed and OpenAlex metadata, manages research Projects, saves provider-independent papers into a project-scoped PostgreSQL library, and can retrieve legally available full text as clean, persisted document text. Chunking, embeddings, pgvector, semantic search, RAG, citation generation, LLM calls, and agents are intentionally not included yet.
 
@@ -25,17 +25,19 @@ Next.js App Router frontend
   │     └── OpenAlex: Works search → JSON parser
   ├── Project workspace → /projects CRUD
   ├── Save Paper → /projects/{project_id}/papers
-  └── Retrieve document → PMC JATS first, then OpenAlex OA location
-                           ↓
-                    FastAPI routes
-                           ↓
-          Project/Paper/Document services
-                           ↓
-               XML / HTML / PDF parsers
-                           ↓
-                     SQLAlchemy 2
-                           ↓
-                     PostgreSQL 16
+  └── Retrieve document → Full-text source discovery
+                                ├── PMC/JATS provider
+                                └── OpenAlex OA provider
+                                         ↓
+                          Ranked FullTextCandidate stream
+                                         ↓
+                                Safe HTTP client
+                                         ↓
+                         XML / HTML / PDF / text parser
+                                         ↓
+                              Unified PaperDocument
+                                         ↓
+                                  PostgreSQL 16
 ```
 
 The current project structure remains intentionally small:
@@ -117,8 +119,8 @@ GitHub's middle file-list column displays the latest commit message, not a custo
 | `backend/services/documents/` | OA discovery, bounded HTTP reads, and content-specific parsers |
 | `backend/database.py` | Engine, Session, Base, initialization, and health query |
 | `frontend/app/` | Next.js App Router search, Project list, and dynamic detail routes |
-| `scripts/init_db.py` | Creates Day 3 tables in PostgreSQL |
-| `tests/` | Day 1–3 regression and behavior tests |
+| `scripts/init_db.py` | Creates the current V1 tables in PostgreSQL |
+| `tests/` | Task 1–5.1 regression and behavior tests |
 
 ## Database Schema
 
@@ -253,13 +255,29 @@ When `source=all`, both searches run concurrently. If one provider is unavailabl
 
 ## Document Retrieval
 
-### Supported full-text sources
+### Metadata providers and full-text providers
+
+Literature metadata currently comes from **PubMed** and **OpenAlex**. That metadata records how a Paper entered the library: `Paper.source`, `external_id`, and DOI.
+
+Full-text discovery is a separate module. Its current providers are:
+
+- **PMC**, which can discover structured JATS/XML from a known PubMed PMID;
+- **OpenAlex OA locations**, which can discover declared public landing pages and PDFs from an OpenAlex ID or DOI.
+
+`PaperDocument.source` records the provider of the content that was actually retrieved, not the Paper metadata provider. A PubMed Paper may therefore persist an OpenAlex-discovered document, and the acquisition/parser pipeline does not branch on `Paper.source`.
+
+PMC structured XML currently receives the highest candidate priority because of document quality and parsability. PMC is one full-text provider, not the platform's core metadata source or a required step in document processing.
+
+### Candidate discovery and ranking
 
 The retrieval service uses saved Paper metadata and never accepts an arbitrary download URL from an API caller:
 
-1. For a saved PubMed paper, NCBI ELink maps the PMID to PMC. When available, PMC JATS/XML is downloaded through NCBI EFetch and preferred over PDF.
-2. If PMC is unavailable or fails, a saved OpenAlex ID—or a DOI saved with either provider—is resolved through the OpenAlex Works API. Only a location declared open access by OpenAlex is considered; `best_oa_location` is preferred, followed by an OA `primary_location`.
-3. An OA location may return XML/JATS, HTML, PDF, or plain text. The response Content-Type and PDF signature determine the parser.
+1. Each full-text provider returns zero or more `FullTextCandidate` values containing `provider`, URL, source kind, Content-Type hint, and quality priority.
+2. Discovery combines and deduplicates candidates, then ranks structured full text before public HTML, PDF, and plain text candidates.
+3. Acquisition processes that one ranked stream. A failed candidate does not prevent the next legal candidate from being attempted.
+4. Every candidate goes through the same safe HTTP module and content-based parser dispatch. Providers never parse documents or download around the safety checks.
+
+OpenAlex discovery considers both `best_oa_location` and an OA `primary_location`, and can return both landing-page and PDF candidates instead of collapsing metadata to one provider-specific URL.
 
 The system does **not** bypass paywalls, authenticate to publisher accounts, use Sci-Hub, defeat PDF protections, or download from caller-supplied URLs.
 
@@ -295,8 +313,9 @@ Invoke-RestMethod `
 
 ### Current limitations
 
-- PMC discovery currently starts from a PubMed PMID; manually entered PMC IDs are not a separate Paper source.
-- OpenAlex fallback depends on a valid saved OpenAlex ID or DOI and on OpenAlex marking the location OA.
+- The PMC provider currently needs a Paper whose known external identifier is a PubMed PMID; manual PMC IDs and cross-provider PMID resolution are not yet implemented.
+- The OpenAlex provider depends on a valid saved OpenAlex ID or DOI and on OpenAlex marking the location OA.
+- Future providers such as arXiv, Unpaywall, or institutional repositories still require their own discovery implementation before they can emit `FullTextCandidate` values.
 - HTML extraction is conservative heuristic text cleanup, not a publisher-specific readability engine.
 - Scanned/image-only and encrypted PDFs are reported as failed; OCR and password handling are intentionally absent.
 - A source larger than 25 MiB is rejected, and transient failures are not automatically retried.
@@ -334,6 +353,17 @@ Verify the frontend production build separately:
 Set-Location frontend
 npm run build
 ```
+
+## Task 5.1 Acceptance Verification
+
+Verified locally on 2026-08-20:
+
+- Provider discovery returned one ranked, deduplicated `FullTextCandidate` stream for acquisition.
+- A PubMed metadata Paper successfully retrieved an OpenAlex-discovered HTML document in the mocked cross-provider test.
+- Structured PMC XML ranked ahead of OpenAlex HTML/PDF candidates; a failed structured candidate correctly fell through to HTML.
+- Automated test result: 40 passed, 0 failed, including all 37 Task 5 regression tests.
+- Next.js production build, `pip check`, and `git diff --check` completed successfully.
+- The real PostgreSQL/PMC smoke Paper still retrieved `PMC1182327` as 28,481 characters under the same Document ID, and a fresh process found exactly one persisted Document row.
 
 ## Task 5 Acceptance Verification
 
