@@ -204,7 +204,7 @@ The API is available at:
 Node.js 20.9 or newer is required. Open a second PowerShell window and run:
 
 ```powershell
-Set-Location 'D:\实习任务\ai-research-platform\frontend'
+Set-Location cd frontend'
 Copy-Item .env.example .env.local
 npm install
 npm run dev
